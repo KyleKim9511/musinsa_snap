@@ -44,9 +44,11 @@ def parse_snap_listing(html: str, base_url: str) -> list[Snap]:
     card_selectors = [
         "li.snap-article",
         "li.snap_item",
+        "li.li_snap",
         "div.snap-list__item",
         "div.sc-list-item",
         "div.snap-grid-item",
+        "ul.snap_list li",
     ]
 
     cards = []
@@ -69,7 +71,7 @@ def parse_snap_listing(html: str, base_url: str) -> list[Snap]:
         if thumbnail:
             thumbnail = urljoin(base_url, thumbnail)
 
-        title_node = card.select_one(".title, .tit, .snap_txt, .info-title") or link
+        title_node = card.select_one(".title, .tit, .snap_txt, .info-title, .list_info") or link
         title = title_node.get_text(strip=True) if title_node else None
         if not title and thumbnail:
             title = link.get("title") or link.get("aria-label")
@@ -151,7 +153,17 @@ def _extract_primary_image(soup: BeautifulSoup, base_url: str) -> str | None:
 def _extract_tags(soup: BeautifulSoup) -> list[str]:
     candidates = []
 
-    for selector in [".tag", ".tags", ".hash-tag", "a[href*='tag=']", "a[class*='tag']", "#hashtag a"]:
+    for selector in [
+        ".tag",
+        ".tags",
+        ".hash-tag",
+        "a[href*='tag=']",
+        "a[class*='tag']",
+        "#hashtag a",
+        "ul.article-tag-list a",
+        "div.styling_tag a",
+        "div.tag_list a",
+    ]:
         for node in soup.select(selector):
             text = node.get_text(strip=True)
             if not text:

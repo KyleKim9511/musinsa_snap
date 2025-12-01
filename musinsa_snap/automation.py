@@ -17,20 +17,28 @@ from .parser import SNAP_LINK_PATTERN, parse_snap_detail
 
 LOGGER = logging.getLogger(__name__)
 
-SNAP_CARD_SELECTOR = "a[href*='/snap/'], a[href*='/mz/snap/']"
+SNAP_CARD_SELECTOR = "a[href*='/snap/'], a[href*='/mz/snap/'], li.snap_item a, li.snap-article a"
 SEARCH_INPUT_CANDIDATES = [
     "input[name='q']",
     "input[name='query']",
     "input[id*='search']",
     "input[placeholder*='검색']",
     "input[type='search']",
+    "form.search input",
 ]
 SNAP_TAB_CANDIDATES = [
     "a[role='tab'][href*='snap']",
     "a[href*='type=snap']",
+    "a[href*='search/snap']",
     "a:has-text('SNAP')",
     "a:has-text('스냅')",
+    "button:has-text('SNAP')",
 ]
+GENDER_FILTERS = {
+    "M": ["button:has-text('남')", "a:has-text('남자')", "label:has-text('남자')"],
+    "F": ["button:has-text('여')", "a:has-text('여자')", "label:has-text('여자')"],
+}
+RECOMMEND_URL = "https://www.musinsa.com/main/musinsa/recommend?gf={gender}"
 
 
 @dataclass
@@ -89,18 +97,23 @@ class SnapAutomation:
         tags_file: Path,
         output_dir: Path = Path("downloads"),
         csv_path: Path = Path("snaps.csv"),
+        json_path: Path = Path("snaps.json"),
         max_per_query: int | None = None,
         scroll_delay: float = 1.5,
         client_delay: float = 0.3,
         headless: bool = True,
+        gender: str = "M",
     ) -> None:
         self.tags_file = tags_file
         self.output_dir = output_dir
         self.csv_path = csv_path
+        self.json_path = json_path
         self.max_per_query = max_per_query
         self.scroll_delay = scroll_delay
         self.client = MusinsaClient(delay=client_delay)
         self.headless = headless
+        self.gender = gender
+        self._records: list[dict[str, str | None]] = []
 
     async def run(self) -> None:
         queries = load_queries(self.tags_file)
@@ -110,12 +123,14 @@ class SnapAutomation:
             for query in queries:
                 await self.process_query(page, query)
             await browser.close()
+        self._write_json()
 
     async def process_query(self, page: Page, query: Query) -> None:
         LOGGER.info("Processing query '%s'", query.query)
-        await page.goto(DEFAULT_BASE_URL, wait_until="networkidle")
+        await page.goto(RECOMMEND_URL.format(gender=self.gender), wait_until="networkidle")
         await self._fill_search(page, query.query)
         await self._click_snap_tab(page)
+        await self._apply_gender_filter(page)
         await self._click_first_snap(page)
         detail_urls = await self._collect_snap_links(page, limit=self.max_per_query)
         LOGGER.info("Found %s snap links for %s", len(detail_urls), query.label)
@@ -139,6 +154,7 @@ class SnapAutomation:
                 }
             )
         self._append_csv(rows)
+        self._records.extend(rows)
 
     async def _fill_search(self, page: Page, query: str) -> None:
         input_box = await _find_first(page, SEARCH_INPUT_CANDIDATES)
@@ -157,6 +173,20 @@ class SnapAutomation:
         else:
             LOGGER.warning("SNAP 탭을 찾지 못했습니다. 전체 결과에서 진행합니다.")
 
+    async def _apply_gender_filter(self, page: Page) -> None:
+        filters = GENDER_FILTERS.get(self.gender.upper())
+        if not filters:
+            return
+        for selector in filters:
+            handle = await _find_first(page, [selector])
+            if handle:
+                try:
+                    await handle.click()
+                    await page.wait_for_load_state("networkidle")
+                    return
+                except Exception:
+                    continue
+
     async def _click_first_snap(self, page: Page) -> None:
         first_card = await _find_first(page, [SNAP_CARD_SELECTOR])
         if first_card:
@@ -168,6 +198,7 @@ class SnapAutomation:
             LOGGER.warning("첫 번째 SNAP 이미지를 찾지 못했습니다.")
 
     async def _collect_snap_links(self, page: Page, *, limit: int | None = None) -> list[str]:
+        target = limit or 10
         seen: set[str] = set()
         no_new_rounds = 0
 
@@ -182,7 +213,7 @@ class SnapAutomation:
                 absolute = urljoin(DEFAULT_BASE_URL, href)
                 if absolute not in seen:
                     seen.add(absolute)
-            if limit and len(seen) >= limit:
+            if len(seen) >= target:
                 break
 
             previous_count = len(seen)
@@ -194,7 +225,7 @@ class SnapAutomation:
                 no_new_rounds = 0
             if no_new_rounds >= 3:
                 break
-        return list(seen)[:limit] if limit else list(seen)
+        return list(seen)[:target]
 
     def _fetch_snap(self, url: str):
         try:
@@ -232,6 +263,17 @@ class SnapAutomation:
             for row in rows:
                 writer.writerow(row)
 
+    def _write_json(self) -> None:
+        ensure_parent(self.json_path)
+        existing: list[dict[str, str | None]] = []
+        if self.json_path.exists():
+            try:
+                existing = json.loads(self.json_path.read_text(encoding="utf-8"))
+            except Exception:
+                existing = []
+        payload = existing + self._records
+        self.json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
 
 def build_cli_args(argv: Sequence[str] | None = None):
     import argparse
@@ -245,10 +287,12 @@ def build_cli_args(argv: Sequence[str] | None = None):
     )
     parser.add_argument("--output-dir", type=Path, default=Path("downloads"), help="이미지 저장 디렉토리")
     parser.add_argument("--csv", type=Path, default=Path("snaps.csv"), help="CSV 저장 경로")
+    parser.add_argument("--json", type=Path, default=Path("snaps.json"), help="JSON 저장 경로")
     parser.add_argument("--limit", type=int, default=None, help="태그별 최대 스냅 수")
     parser.add_argument("--scroll-delay", type=float, default=1.5, help="스크롤 사이 대기 시간(초)")
     parser.add_argument("--request-delay", type=float, default=0.3, help="HTTP 요청 간 대기 시간(초)")
     parser.add_argument("--headless", action="store_true", help="헤드리스 모드 사용")
+    parser.add_argument("--gender", choices=["M", "F"], default="M", help="필터할 성별")
     parser.add_argument("--verbose", action="store_true", help="디버그 로그 표시")
     return parser.parse_args(argv)
 
@@ -260,10 +304,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         tags_file=args.tags_file,
         output_dir=args.output_dir,
         csv_path=args.csv,
+        json_path=args.json,
         max_per_query=args.limit,
         scroll_delay=args.scroll_delay,
         client_delay=args.request_delay,
         headless=args.headless,
+        gender=args.gender,
     )
     asyncio.run(automation.run())
     return 0

@@ -10,9 +10,9 @@
    ```
 
 2. 스크래핑 실행 (실제 스냅 검색 URL 기준)
- ```bash
+```bash
  python -m musinsa_snap.cli "나이키" --gender M --start-page 1 --end-page 2 --limit 20 --delay 0.5 --json-out snaps.json --csv-out snaps.csv
- ```
+```
 
    주요 옵션
    - `keyword`: 필수 검색어 (예: 나이키)
@@ -26,7 +26,7 @@
    - `--verbose`: 상세 로그 출력
    - 기본 도메인은 `https://www.musinsa.com/`입니다. 필요 시 `--base-url` 혹은 `MusinsaClient(base_url=...)`로 교체할 수 있습니다.
 
-### 검색 자동화 + 이미지/CSV 저장
+### 검색 자동화 + 이미지/CSV/JSON 저장
 
 1. Playwright 드라이버 설치(최초 1회)
    ```bash
@@ -45,17 +45,24 @@
    ]
    ```
 
-3. 자동화 실행 예시
+3. 자동화 실행 예시 (남/여 필터 포함)
 
    ```bash
-   python -m musinsa_snap.automation --tags-file musinsa_TAG.json --limit 50 --output-dir downloads --csv snaps.csv
+   python -m musinsa_snap.automation \
+     --tags-file musinsa_TAG.json \
+     --gender M \
+     --limit 10 \
+     --output-dir downloads \
+     --csv snaps.csv \
+     --json snaps.json
    ```
 
-   동작 요약
-   - 무신사 메인 검색창에 `musinsa_TAG.json`의 검색어를 순차 입력
-   - SNAP 탭 자동 클릭 후 첫 번째 결과 이미지 자동 클릭
-   - 페이지를 아래로 스크롤하며 스냅 상세 링크 수집, 이미지 다운로드 및 해시태그 추출
-   - 이미지(검색어별 폴더)와 CSV(`query,id,url,title,author,taken_at,tags,image_path`) 저장
+   동작 요약 (요청하신 플로우)
+   - 랜딩: `https://www.musinsa.com/main/musinsa/recommend?gf=M` (또는 `--gender F` 시 여성)
+   - 메인 검색창에 `musinsa_TAG.json`의 검색어를 순차로 입력 후 SNAP/코디 탭 선택
+   - 필터에서 남/여 버튼을 클릭해 성별을 고정
+   - 최좌상단 SNAP 이미지를 한 번 열어 정상 연결을 확인한 뒤 닫고, 스크롤하며 상위 10개 스냅 링크를 수집
+   - 각 스냅 상세에서 파란색 해시태그까지 모아 이미지 다운로드, CSV(`query,id,url,title,author,taken_at,tags,image_path`) 및 JSON(`snaps.json`) 저장
 
 ## 수집 결과 예시
 
