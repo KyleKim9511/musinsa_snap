@@ -1,42 +1,57 @@
 from __future__ import annotations
 
-import asyncio
 import csv
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 from urllib.parse import urljoin
 
-from playwright.async_api import Page, async_playwright
+from selenium import webdriver
+from selenium.webdriver import ChromeOptions
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from webdriver_manager.chrome import ChromeDriverManager
 
 from .client import DEFAULT_BASE_URL, MusinsaClient
+from .models import Snap
 from .parser import SNAP_LINK_PATTERN, parse_snap_detail
 
 LOGGER = logging.getLogger(__name__)
 
 SNAP_CARD_SELECTOR = "a[href*='/snap/'], a[href*='/mz/snap/'], li.snap_item a, li.snap-article a"
 SEARCH_INPUT_CANDIDATES = [
-    "input[name='q']",
-    "input[name='query']",
-    "input[id*='search']",
-    "input[placeholder*='검색']",
-    "input[type='search']",
-    "form.search input",
+    "css:input[name='q']",
+    "css:input[name='query']",
+    "css:input[id*='search']",
+    "css:input[placeholder*='검색']",
+    "css:input[type='search']",
+    "css:form.search input",
 ]
 SNAP_TAB_CANDIDATES = [
-    "a[role='tab'][href*='snap']",
-    "a[href*='type=snap']",
-    "a[href*='search/snap']",
-    "a:has-text('SNAP')",
-    "a:has-text('스냅')",
-    "button:has-text('SNAP')",
+    "css:a[role='tab'][href*='snap']",
+    "css:a[href*='type=snap']",
+    "css:a[href*='search/snap']",
+    "xpath://a[contains(., 'SNAP') or contains(., '스냅')]",
+    "xpath://button[contains(., 'SNAP') or contains(., '스냅')]",
 ]
 GENDER_FILTERS = {
-    "M": ["button:has-text('남')", "a:has-text('남자')", "label:has-text('남자')"],
-    "F": ["button:has-text('여')", "a:has-text('여자')", "label:has-text('여자')"],
+    "M": [
+        "xpath://button[contains(., '남') or contains(., '남성')]",
+        "xpath://a[contains(., '남자')]",
+        "xpath://label[contains(., '남자')]",
+    ],
+    "F": [
+        "xpath://button[contains(., '여') or contains(., '여성')]",
+        "xpath://a[contains(., '여자')]",
+        "xpath://label[contains(., '여자')]",
+    ],
 }
 RECOMMEND_URL = "https://www.musinsa.com/main/musinsa/recommend?gf={gender}"
 
@@ -79,12 +94,20 @@ def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-async def _find_first(page: Page, selectors: Sequence[str]):
-    for selector in selectors:
+def _find_first(driver: webdriver.Chrome, selectors: Sequence[str]):
+    wait = WebDriverWait(driver, 5)
+    for raw in selectors:
         try:
-            handle = page.locator(selector).first
-            await handle.wait_for(state="visible", timeout=4000)
-            return handle
+            if raw.startswith("xpath:"):
+                selector = raw.replace("xpath:", "", 1)
+                locator = (By.XPATH, selector)
+            elif raw.startswith("css:"):
+                selector = raw.replace("css:", "", 1)
+                locator = (By.CSS_SELECTOR, selector)
+            else:
+                locator = (By.CSS_SELECTOR, raw)
+            element = wait.until(EC.visibility_of_element_located(locator))
+            return element
         except Exception:
             continue
     return None
@@ -101,7 +124,7 @@ class SnapAutomation:
         max_per_query: int | None = None,
         scroll_delay: float = 1.5,
         client_delay: float = 0.3,
-        headless: bool = True,
+        headless: bool = False,
         gender: str = "M",
     ) -> None:
         self.tags_file = tags_file
@@ -115,29 +138,42 @@ class SnapAutomation:
         self.gender = gender
         self._records: list[dict[str, str | None]] = []
 
-    async def run(self) -> None:
+    def _build_driver(self) -> webdriver.Chrome:
+        options = ChromeOptions()
+        if self.headless:
+            options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=options)
+        driver.set_window_size(1440, 900)
+        driver.implicitly_wait(5)
+        return driver
+
+    def run(self) -> None:
         queries = load_queries(self.tags_file)
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=self.headless)
-            page = await browser.new_page(locale="ko-KR")
+        driver = self._build_driver()
+        try:
             for query in queries:
-                await self.process_query(page, query)
-            await browser.close()
+                self.process_query(driver, query)
+        finally:
+            driver.quit()
         self._write_json()
 
-    async def process_query(self, page: Page, query: Query) -> None:
+    def process_query(self, driver: webdriver.Chrome, query: Query) -> None:
         LOGGER.info("Processing query '%s'", query.query)
-        await page.goto(RECOMMEND_URL.format(gender=self.gender), wait_until="networkidle")
-        await self._fill_search(page, query.query)
-        await self._click_snap_tab(page)
-        await self._apply_gender_filter(page)
-        await self._click_first_snap(page)
-        detail_urls = await self._collect_snap_links(page, limit=self.max_per_query)
+        driver.get(RECOMMEND_URL.format(gender=self.gender))
+        self._fill_search(driver, query.query)
+        self._click_snap_tab(driver)
+        self._apply_gender_filter(driver)
+        self._click_first_snap(driver)
+        detail_urls = self._collect_snap_links(driver, limit=self.max_per_query)
         LOGGER.info("Found %s snap links for %s", len(detail_urls), query.label)
 
         rows = []
         for link in detail_urls:
-            snap = self._fetch_snap(link)
+            snap = self._fetch_snap(driver, link)
             if not snap:
                 continue
             image_path = self._download_image(snap.image_url, query.label, snap.id)
@@ -156,56 +192,57 @@ class SnapAutomation:
         self._append_csv(rows)
         self._records.extend(rows)
 
-    async def _fill_search(self, page: Page, query: str) -> None:
-        input_box = await _find_first(page, SEARCH_INPUT_CANDIDATES)
+    def _fill_search(self, driver: webdriver.Chrome, query: str) -> None:
+        input_box = _find_first(driver, SEARCH_INPUT_CANDIDATES)
         if not input_box:
             raise RuntimeError("검색창을 찾을 수 없습니다.")
-        await input_box.fill("")
-        await input_box.type(query)
-        await input_box.press("Enter")
-        await page.wait_for_load_state("networkidle")
+        input_box.clear()
+        input_box.send_keys(query)
+        input_box.send_keys(Keys.ENTER)
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
 
-    async def _click_snap_tab(self, page: Page) -> None:
-        tab = await _find_first(page, SNAP_TAB_CANDIDATES)
+    def _click_snap_tab(self, driver: webdriver.Chrome) -> None:
+        tab = _find_first(driver, SNAP_TAB_CANDIDATES)
         if tab:
-            await tab.click()
-            await page.wait_for_load_state("networkidle")
+            tab.click()
+            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
         else:
             LOGGER.warning("SNAP 탭을 찾지 못했습니다. 전체 결과에서 진행합니다.")
 
-    async def _apply_gender_filter(self, page: Page) -> None:
+    def _apply_gender_filter(self, driver: webdriver.Chrome) -> None:
         filters = GENDER_FILTERS.get(self.gender.upper())
         if not filters:
             return
         for selector in filters:
-            handle = await _find_first(page, [selector])
+            handle = _find_first(driver, [selector])
             if handle:
                 try:
-                    await handle.click()
-                    await page.wait_for_load_state("networkidle")
+                    handle.click()
+                    WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
                     return
                 except Exception:
                     continue
 
-    async def _click_first_snap(self, page: Page) -> None:
-        first_card = await _find_first(page, [SNAP_CARD_SELECTOR])
+    def _click_first_snap(self, driver: webdriver.Chrome) -> None:
+        first_card = _find_first(driver, [SNAP_CARD_SELECTOR])
         if first_card:
-            await first_card.scroll_into_view_if_needed()
-            await first_card.click()
-            await page.wait_for_load_state("networkidle")
-            await page.go_back()
+            driver.execute_script("arguments[0].scrollIntoView(true);", first_card)
+            first_card.click()
+            time.sleep(1)
+            driver.back()
+            WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
         else:
             LOGGER.warning("첫 번째 SNAP 이미지를 찾지 못했습니다.")
 
-    async def _collect_snap_links(self, page: Page, *, limit: int | None = None) -> list[str]:
+    def _collect_snap_links(self, driver: webdriver.Chrome, *, limit: int | None = None) -> list[str]:
         target = limit or 10
         seen: set[str] = set()
         no_new_rounds = 0
 
         while True:
-            links = await page.query_selector_all(SNAP_CARD_SELECTOR)
+            links = driver.find_elements(By.CSS_SELECTOR, SNAP_CARD_SELECTOR)
             for link in links:
-                href = await link.get_attribute("href")
+                href = link.get_attribute("href")
                 if not href:
                     continue
                 if not SNAP_LINK_PATTERN.search(href):
@@ -217,8 +254,8 @@ class SnapAutomation:
                 break
 
             previous_count = len(seen)
-            await page.evaluate("window.scrollBy(0, document.body.scrollHeight);")
-            await page.wait_for_timeout(int(self.scroll_delay * 1000))
+            driver.execute_script("window.scrollBy(0, document.body.scrollHeight);")
+            time.sleep(self.scroll_delay)
             if len(seen) == previous_count:
                 no_new_rounds += 1
             else:
@@ -227,13 +264,24 @@ class SnapAutomation:
                 break
         return list(seen)[:target]
 
-    def _fetch_snap(self, url: str):
+    def _fetch_snap(self, driver: webdriver.Chrome, url: str):
+        current = driver.current_window_handle
         try:
-            html = self.client.fetch_detail(url)
-            return parse_snap_detail(html, self.client.base_url)
+            driver.switch_to.new_window("tab")
+            driver.get(url)
+            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
+            html = driver.page_source
+            snap = parse_snap_detail(html, self.client.base_url, existing=Snap(id=None, url=url))
+            return snap
         except Exception as exc:  # pragma: no cover - network issues
             LOGGER.warning("%s 에서 스냅을 불러오지 못했습니다: %s", url, exc)
             return None
+        finally:
+            try:
+                driver.close()
+                driver.switch_to.window(current)
+            except Exception:
+                pass
 
     def _download_image(self, image_url: str | None, query_label: str, snap_id: str | None) -> Path | None:
         if not image_url:
@@ -278,7 +326,7 @@ class SnapAutomation:
 def build_cli_args(argv: Sequence[str] | None = None):
     import argparse
 
-    parser = argparse.ArgumentParser(description="Automate Musinsa SNAP scraping with Playwright")
+    parser = argparse.ArgumentParser(description="Automate Musinsa SNAP scraping with Selenium")
     parser.add_argument(
         "--tags-file",
         type=Path,
@@ -311,7 +359,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         headless=args.headless,
         gender=args.gender,
     )
-    asyncio.run(automation.run())
+    automation.run()
     return 0
 
 
